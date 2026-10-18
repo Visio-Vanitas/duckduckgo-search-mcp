@@ -1,0 +1,11 @@
+This product includes software developed by Bogdan Finn (TLS-Client).
+TLS-Client is distributed under its own license, reproduced in licenses/tls-client.txt.
+Other dependencies retain their respective copyright notices and licenses.
+The MIT license in the repository root applies to this project's original code.
+
+The DuckDuckGo HTML form parameters and DOM selectors were independently implemented
+with reference to SearXNG's DuckDuckGo engine:
+https://github.com/searxng/searxng/blob/master/searx/engines/duckduckgo.py
+No SearXNG Python source or runtime is included.
+
+This project is not affiliated with DuckDuckGo or SearXNG.

@@ -1,0 +1,21 @@
+[Unit]
+Description=DuckDuckGo search REST and HTTP JSON-RPC service
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/local/bin/duckduckgo-search-mcp
+EnvironmentFile=/etc/duckduckgo-search-mcp.env
+Environment=GOMEMLIMIT=24MiB
+Environment=GOGC=60
+Restart=on-failure
+RestartSec=2
+MemoryMax=64M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
