@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"database/sql"
@@ -16,12 +17,22 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	_ "modernc.org/sqlite"
 )
 
 type jsonNumber = json.Number
+
+type rpcReadError struct {
+	code    int
+	message string
+}
+
+func (e *rpcReadError) Error() string { return e.message }
+
 type app struct {
+	searchSlots            chan struct{}
 	apiKey                 string
 	db                     *sql.DB
 	client                 *http.Client
@@ -29,14 +40,18 @@ type app struct {
 }
 
 func (a *app) authorized(ctx context.Context, header string) (bool, error) {
-	if !strings.HasPrefix(header, "Bearer ") {
+	parts := strings.Fields(header)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 		return false, nil
 	}
-	token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+	token := parts[1]
 	if a.apiKey != "" {
 		return subtle.ConstantTimeCompare([]byte(token), []byte(a.apiKey)) == 1, nil
 	}
 	key := strings.TrimPrefix(token, "sk-")
+	if key == "" {
+		return false, nil
+	}
 	var status, remaining, unlimited, expiry int64
 	err := a.db.QueryRowContext(ctx, "SELECT status,remain_quota,unlimited_quota,expired_time FROM tokens WHERE key=? AND deleted_at IS NULL LIMIT 1", key).Scan(&status, &remaining, &unlimited, &expiry)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -58,6 +73,11 @@ func reply(w http.ResponseWriter, status int, v any) {
 }
 func replyError(w http.ResponseWriter, err error) {
 	var e *apiError
+	var rpcErr *rpcReadError
+	if errors.As(err, &rpcErr) {
+		reply(w, 400, map[string]any{"error": rpcErr.message})
+		return
+	}
 	if errors.As(err, &e) {
 		reply(w, e.status, map[string]any{"error": e.message})
 	} else {
@@ -82,18 +102,17 @@ func readArgs(r *http.Request) (map[string]any, error) {
 	if err != nil {
 		return nil, bad("Invalid request body")
 	}
-	if len(raw) == 0 || len(raw) > 65536 {
-		return nil, bad("Request body must be 1 to 65536 bytes")
+	if len(raw) > 65536 {
+		return nil, &apiError{413, "Request body exceeds 65536 bytes"}
+	}
+	if !json.Valid(raw) {
+		return nil, &rpcReadError{-32700, "Invalid JSON"}
 	}
 	var args map[string]any
-	d := json.NewDecoder(strings.NewReader(string(raw)))
+	d := json.NewDecoder(bytes.NewReader(raw))
 	d.UseNumber()
 	if err := d.Decode(&args); err != nil || args == nil {
-		return nil, bad("JSON body must be an object")
-	}
-	var trailing any
-	if d.Decode(&trailing) != io.EOF {
-		return nil, bad("Invalid trailing JSON")
+		return nil, &rpcReadError{-32600, "JSON body must be an object"}
 	}
 	return args, nil
 }
@@ -156,9 +175,24 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reply(w, 401, map[string]any{"error": "Invalid or unavailable search token"})
 		return
 	}
+	isRPC := r.URL.Path != "/v1/search"
+	if r.Method != http.MethodPost && (isRPC || r.Method != http.MethodGet) {
+		allowed := "GET, POST, OPTIONS"
+		if isRPC {
+			allowed = "POST, OPTIONS"
+		}
+		w.Header().Set("Allow", allowed)
+		replyError(w, &apiError{405, "Method not allowed"})
+		return
+	}
 	args, err := readArgs(r)
 	if err != nil {
-		replyError(w, err)
+		var rpcErr *rpcReadError
+		if isRPC && errors.As(err, &rpcErr) {
+			rpcError(w, nil, rpcErr.code, rpcErr.message)
+		} else {
+			replyError(w, err)
+		}
 		return
 	}
 	if r.URL.Path == "/v1/search" {
@@ -175,15 +209,30 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reply(w, 200, data)
 		return
 	}
-	method, ok := args["method"].(string)
-	if !ok {
-		replyError(w, bad("MCP method must be a string"))
+	method, methodOK := args["method"].(string)
+	id, hasID := args["id"]
+	validID := true
+	switch id.(type) {
+	case nil, string, json.Number:
+	default:
+		validID = false
+	}
+	if args["jsonrpc"] != "2.0" || !methodOK || method == "" || !validID {
+		rpcError(w, nil, -32600, "Invalid JSON-RPC request")
 		return
 	}
-	id := args["id"]
-	if strings.HasPrefix(method, "notifications/") {
+	// MCP notifications do not perform tool calls and never receive a response.
+	if !hasID {
 		reply(w, 204, nil)
 		return
+	}
+	if params, exists := args["params"]; exists {
+		switch params.(type) {
+		case map[string]any, []any:
+		default:
+			rpcError(w, id, -32602, "params must be an object or array")
+			return
+		}
 	}
 	switch method {
 	case "initialize":
@@ -195,7 +244,7 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "tools/call":
 		params, ok := args["params"].(map[string]any)
 		if !ok {
-			replyError(w, bad("MCP params must be an object"))
+			rpcError(w, id, -32602, "MCP params must be an object")
 			return
 		}
 		if params["name"] != "web_search" {
@@ -204,12 +253,12 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		inputs, ok := params["arguments"].(map[string]any)
 		if !ok {
-			toolError(w, id, bad("Search arguments must be an object"))
+			rpcError(w, id, -32602, "Search arguments must be an object")
 			return
 		}
 		in, err := parseInput(inputs)
 		if err != nil {
-			toolError(w, id, err)
+			rpcError(w, id, -32602, err.Error())
 			return
 		}
 		data, err := a.search(r.Context(), in)
@@ -228,6 +277,9 @@ func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func validateAuthConfig(apiKey, dbPath string) error {
+	if strings.IndexFunc(apiKey, unicode.IsSpace) >= 0 {
+		return errors.New("SEARCH_API_KEY must not contain whitespace")
+	}
 	if (apiKey == "") == (dbPath == "") {
 		return errors.New("configure exactly one of SEARCH_API_KEY or --db")
 	}
@@ -238,25 +290,20 @@ func main() {
 	port := flag.Int("port", 18085, "Loopback HTTP port")
 	dbPath := flag.String("db", "", "Optional read-only new-api token database (alternative to SEARCH_API_KEY)")
 	proxyURL := flag.String("proxy", "", "Optional HTTP(S) or SOCKS5(H) upstream proxy")
+	maxConcurrent := flag.Int("max-concurrent", 4, "Maximum simultaneous searches; excess requests fail immediately")
 	flag.Parse()
+	if *maxConcurrent < 1 {
+		log.Fatal("max-concurrent must be positive")
+	}
 	apiKey := os.Getenv("SEARCH_API_KEY")
 	if err := validateAuthConfig(apiKey, *dbPath); err != nil {
 		log.Fatal(err)
 	}
-	proxyAddress := ""
-	if *proxyURL != "" {
-		u, err := url.Parse(*proxyURL)
-		if err != nil || u.Host == "" {
-			log.Fatal("proxy must include a scheme and host")
-		}
-		switch u.Scheme {
-		case "http", "https", "socks5", "socks5h":
-		default:
-			log.Fatal("unsupported proxy scheme")
-		}
-		proxyAddress = u.Host
+	normalizedProxy, proxyAddress, err := normalizeProxy(*proxyURL)
+	if err != nil {
+		log.Fatal(err)
 	}
-	transport, err := newBrowserTransport(*proxyURL)
+	transport, err := newBrowserTransport(normalizedProxy)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -275,7 +322,7 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-	a := &app{apiKey: apiKey, db: db, client: client, endpoint: ddgURL, proxyAddress: proxyAddress}
+	a := &app{searchSlots: make(chan struct{}, *maxConcurrent), apiKey: apiKey, db: db, client: client, endpoint: ddgURL, proxyAddress: proxyAddress}
 
 	server := &http.Server{Addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(*port)), Handler: a, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16384}
 	log.Printf("DuckDuckGo search REST/MCP listening on %s", server.Addr)

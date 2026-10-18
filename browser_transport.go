@@ -1,9 +1,13 @@
 package main
 
 import (
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+
+	"golang.org/x/net/proxy"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
@@ -16,10 +20,33 @@ type browserTransport struct{ client tlsclient.HttpClient }
 
 func newBrowserTransport(proxyURL string) (http.RoundTripper, error) {
 	timeout := 30 * time.Second
-	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(),
+	options := []tlsclient.HttpClientOption{
 		tlsclient.WithClientProfile(profiles.Chrome_150), tlsclient.WithTimeoutSeconds(12), tlsclient.WithDisableHttp3(),
-		tlsclient.WithNotFollowRedirects(), tlsclient.WithProxyUrl(proxyURL),
-		tlsclient.WithTransportOptions(&tlsclient.TransportOptions{DisableKeepAlives: true, MaxIdleConns: 4, MaxIdleConnsPerHost: 4, MaxConnsPerHost: 4, IdleConnTimeout: &timeout}))
+		tlsclient.WithNotFollowRedirects(),
+		tlsclient.WithTransportOptions(&tlsclient.TransportOptions{DisableKeepAlives: true, MaxIdleConns: 4, MaxIdleConnsPerHost: 4, MaxConnsPerHost: 4, IdleConnTimeout: &timeout}),
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme == "socks5" || u.Scheme == "socks5h" {
+		// The dependency's default SOCKS wrapper calls Dial without a context.
+		options = append(options, tlsclient.WithProxyDialerFactory(func(_ string, timeout time.Duration, local *net.TCPAddr, _ fhttp.Header, _ tlsclient.Logger) (proxy.ContextDialer, error) {
+			var auth *proxy.Auth
+			if u.User != nil {
+				password, _ := u.User.Password()
+				auth = &proxy.Auth{User: u.User.Username(), Password: password}
+			}
+			dialer, err := proxy.SOCKS5("tcp", u.Host, auth, &net.Dialer{Timeout: timeout, LocalAddr: local})
+			if err != nil {
+				return nil, err
+			}
+			return dialer.(proxy.ContextDialer), nil
+		}))
+	} else {
+		options = append(options, tlsclient.WithProxyUrl(proxyURL))
+	}
+	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 	if err != nil {
 		return nil, err
 	}

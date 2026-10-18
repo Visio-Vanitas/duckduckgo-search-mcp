@@ -58,7 +58,7 @@ func TestReadOnlyAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	_, err = db.Exec(`CREATE TABLE tokens (key TEXT,status INTEGER,remain_quota INTEGER,unlimited_quota INTEGER,expired_time INTEGER,deleted_at INTEGER); INSERT INTO tokens VALUES ('unlimited',1,0,1,-1,NULL),('expired',1,100,0,1,NULL),('disabled',2,100,0,-1,NULL),('deleted',1,100,0,-1,1)`)
+	_, err = db.Exec(`CREATE TABLE tokens (key TEXT,status INTEGER,remain_quota INTEGER,unlimited_quota INTEGER,expired_time INTEGER,deleted_at INTEGER); INSERT INTO tokens VALUES ('unlimited',1,0,1,-1,NULL),('expired',1,100,0,1,NULL),('disabled',2,100,0,-1,NULL),('deleted',1,100,0,-1,1),('',1,0,1,-1,NULL)`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestReadOnlyAuth(t *testing.T) {
 	}
 	defer ro.Close()
 	a := app{db: ro}
-	for token, want := range map[string]bool{"unlimited": true, "expired": false, "disabled": false, "deleted": false, "missing": false} {
+	for token, want := range map[string]bool{"": false, "unlimited": true, "expired": false, "disabled": false, "deleted": false, "missing": false} {
 		ok, err := a.authorized(context.Background(), "Bearer sk-"+token)
 		if err != nil || ok != want {
 			t.Fatalf("%s: %v %v", token, ok, err)
@@ -97,7 +97,7 @@ func TestRESTAndMCP(t *testing.T) {
 		w.Write([]byte(fixture))
 	}))
 	defer upstream.Close()
-	a := app{apiKey: "test-secret", client: &http.Client{Timeout: time.Second}, endpoint: upstream.URL}
+	a := app{searchSlots: make(chan struct{}, 4), apiKey: "test-secret", client: &http.Client{Timeout: time.Second}, endpoint: upstream.URL}
 	tests := []struct {
 		path, body string
 		status     int
@@ -111,7 +111,7 @@ func TestRESTAndMCP(t *testing.T) {
 		{"/mcp/search", `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"fail"}}}`, 200, `"isError":true`},
 		{"/mcp", `{"jsonrpc":"2.0","method":"notifications/initialized"}`, 204, ""},
 		{"/mcp", `{"jsonrpc":"2.0","id":3,"method":"ping"}`, 200, `"result":{}`},
-		{"/mcp", `{"method":"unknown","id":3}`, 200, "-32601"},
+		{"/mcp", `{"jsonrpc":"2.0","method":"unknown","id":3}`, 200, "-32601"},
 	}
 	for _, test := range tests {
 		r := httptest.NewRequest("POST", test.path, strings.NewReader(test.body))
