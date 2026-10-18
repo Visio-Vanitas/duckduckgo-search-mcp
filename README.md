@@ -63,7 +63,7 @@ curl -sS http://127.0.0.1:18085/mcp \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"Python asyncio TaskGroup 文档","max_results":5}}}'
 ```
 
-这是一个小型 HTTP JSON-RPC 实现，协议版本返回 `2024-11-05`。未实现 STDIO、SSE 或完整的 MCP 传输/版本协商机制，不声明与所有 MCP 客户端兼容。调用方需支持这里展示的 HTTP 请求格式。上游搜索失败时，工具结果返回 `isError: true`。
+这是一个小型 HTTP JSON-RPC 实现，协议版本返回 `2024-11-05`。未实现 STDIO、SSE 或完整的 MCP 传输/版本协商机制，不声明与所有 MCP 客户端兼容。请求必须包含 `jsonrpc: "2.0"`；MCP 端点仅接受 POST。未实现批量请求。无 `id` 的通知返回 HTTP 204，并且不会触发搜索。调用方需支持这里展示的 HTTP 请求格式。上游搜索失败时，工具结果返回 `isError: true`。
 
 ## 配置
 
@@ -71,9 +71,10 @@ curl -sS http://127.0.0.1:18085/mcp \
 -port   监听端口，默认 18085，地址固定为 127.0.0.1
 -proxy  可选出口代理，例如 socks5h://127.0.0.1:1080
 -db     可选的只读 new-api Token 数据库路径
+-max-concurrent  同时执行的搜索上限，默认 4；超额请求立即失败
 ```
 
-`SEARCH_API_KEY` 与 `--db` 必须且只能配置一个。缺少鉴权配置或同时配置两个时，程序拒绝启动。
+`SEARCH_API_KEY` 不得包含空白字符。`SEARCH_API_KEY` 与 `--db` 必须且只能配置一个。缺少鉴权配置或同时配置两个时，程序拒绝启动。
 
 使用 API Key 与代理：
 
@@ -88,7 +89,9 @@ SEARCH_API_KEY="$SEARCH_API_KEY" ./build/duckduckgo-search-mcp \
 env -u SEARCH_API_KEY ./build/duckduckgo-search-mcp -db /path/to/tokens.db
 ```
 
-数据库需有 `tokens` 表及代码使用的字段：`key`、`status`、`remain_quota`、`unlimited_quota`、`expired_time`、`deleted_at`。验证状态、额度、过期时间与软删除状态；数据库只读，不扣除额度。数据库出错时请求失败，不回退到其他鉴权方式。
+数据库需有 `tokens` 表及代码使用的字段：`key`、`status`、`remain_quota`、`unlimited_quota`、`expired_time`、`deleted_at`。验证状态、额度、过期时间与软删除状态；数据库只读，不扣除额度。数据库出错时请求失败，不回退到其他鉴权方式。此模式仅做上述 Token 检查，未实现上游平台的用户状态、IP 白名单等完整授权策略；有这些要求时需由入口网关另行执行。
+
+HTTP/HTTPS 代理省略端口时分别使用 80/443；SOCKS 代理须显式指定端口。SOCKS 拨号和握手响应请求取消。
 
 `/health` 仅检查已配置的本地数据库和代理 TCP 连通性，不探测 DuckDuckGo。监听地址固定为回环；如需远程访问，应自行配置受控反向代理及 TLS。
 
@@ -104,9 +107,11 @@ make build-linux  # Linux amd64 单二进制
 
 ## 限制与维护
 
-DuckDuckGo HTML 接口可能限流、要求验证码或改变页面结构。项目不解决验证码，不轮换身份或出口，也不承诺稳定绕过访问限制。请遵守上游使用规则并控制调用频率；本服务没有内置请求限速或结果缓存。
+DuckDuckGo HTML 接口可能限流、要求验证码或改变页面结构。项目不解决验证码，不轮换身份或出口，也不承诺稳定绕过访问限制。请遵守上游使用规则并控制调用频率；本服务没有按时间窗口的请求限速或结果缓存。`-max-concurrent` 约束完整搜索生命周期（包括读取和解析），超额 REST 请求返回 HTTP 503，MCP 工具返回 `isError: true`；不会无界排队。
 
 搜索只读取第一结果页。MCP 传输、客户端兼容性和 HTML 解析都有明确边界；遇到错误时请保留 HTTP 状态和错误文本排查。不要把未经审查的网页文字当作可执行指令。
+
+本轮代码审查的已修复问题和剩余缺口见 [代码审查记录](docs/review-2026-10-18.md)。
 
 ## 许可证与参考
 

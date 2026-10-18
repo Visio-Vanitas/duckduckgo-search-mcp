@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -198,14 +199,18 @@ func canonicalURL(raw string) string {
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
 		return ""
 	}
-	q := u.Query()
-	for k := range q {
-		lower := strings.ToLower(k)
-		if strings.HasPrefix(lower, "utm_") || lower == "msclkid" || lower == "fbclid" {
-			q.Del(k)
+	parts := strings.Split(u.RawQuery, "&")
+	kept := parts[:0]
+	for _, part := range parts {
+		key, _, _ := strings.Cut(part, "=")
+		decoded, err := url.QueryUnescape(key)
+		lower := strings.ToLower(decoded)
+		if err == nil && (strings.HasPrefix(lower, "utm_") || lower == "msclkid" || lower == "fbclid") {
+			continue
 		}
+		kept = append(kept, part)
 	}
-	u.RawQuery = q.Encode()
+	u.RawQuery = strings.Join(kept, "&")
 	u.Fragment = ""
 	return u.String()
 }
@@ -253,6 +258,12 @@ func parseResults(body io.Reader, maximum int) ([]result, error) {
 	return results, nil
 }
 func (a *app) search(ctx context.Context, in searchInput) (searchResponse, error) {
+	select {
+	case a.searchSlots <- struct{}{}:
+		defer func() { <-a.searchSlots }()
+	default:
+		return searchResponse{}, &apiError{503, "Search concurrency limit reached"}
+	}
 	start := time.Now()
 	v := formFor(in)
 	form := "q=" + url.QueryEscape(v.Get("q")) + "&b=&kl=" + url.QueryEscape(v.Get("kl"))
@@ -295,7 +306,7 @@ func (a *app) search(ctx context.Context, in searchInput) (searchResponse, error
 	if len(data) > 2*1024*1024 {
 		return searchResponse{}, &apiError{502, "DuckDuckGo response exceeded 2 MiB"}
 	}
-	results, err := parseResults(strings.NewReader(string(data)), in.Max)
+	results, err := parseResults(bytes.NewReader(data), in.Max)
 	if err != nil {
 		return searchResponse{}, &apiError{502, err.Error()}
 	}
